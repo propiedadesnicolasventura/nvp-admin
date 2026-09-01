@@ -803,5 +803,231 @@ setInterval(function(){
 
 })();
 </script>
+<script>(function(){
+
+// ── FIREBASE CONFIG ───────────────────────────────────────────────────
+var FB_CONFIG = {
+  apiKey: "AIzaSyAPGCp6tFI3Zw7u8-zge5LzEtnJ1S4XBzY",
+  authDomain: "nvp-admin.firebaseapp.com",
+  projectId: "nvp-admin",
+  storageBucket: "nvp-admin.firebasestorage.app",
+  messagingSenderId: "824716951717",
+  appId: "1:824716951717:web:9adbb0bb562b9fa0cd0d4c"
+};
+
+// ── COLECCIONES ───────────────────────────────────────────────────────
+// nvp_contratos, nvp_pagos, nvp_gastos, nvp_vacantes, nvp_liquidaciones, nvp_hist_aumentos
+
+var DB = null;
+var SYNC_KEYS = ['nvp_c','nvp_pagos','nvp_gastos','nvp_vacantes','nvp_liquidaciones','nvp_hist_aumentos','nvp_cfg'];
+var COL_MAP = {
+  'nvp_c':'nvp_contratos',
+  'nvp_pagos':'nvp_pagos',
+  'nvp_gastos':'nvp_gastos',
+  'nvp_vacantes':'nvp_vacantes',
+  'nvp_liquidaciones':'nvp_liquidaciones',
+  'nvp_hist_aumentos':'nvp_hist_aumentos',
+  'nvp_cfg':'nvp_config'
+};
+
+// Status indicator
+function setStatus(msg, color){
+  var el = document.getElementById('fb-status');
+  if(!el) return;
+  el.textContent = msg;
+  el.style.color = color||'#a5b4fc';
+}
+
+// ── INIT FIREBASE ─────────────────────────────────────────────────────
+function initFirebase(){
+  // Load Firebase SDK from CDN
+  var script1 = document.createElement('script');
+  script1.src = 'https://www.gstatic.com/firebasejs/10.7.0/firebase-app-compat.js';
+  script1.onload = function(){
+    var script2 = document.createElement('script');
+    script2.src = 'https://www.gstatic.com/firebasejs/10.7.0/firebase-firestore-compat.js';
+    script2.onload = function(){
+      try {
+        if(!firebase.apps.length) firebase.initializeApp(FB_CONFIG);
+        DB = firebase.firestore();
+        setStatus('🔥 Conectado', '#6ee7b7');
+        syncFromFirebase();
+        startRealtimeListeners();
+      } catch(e) {
+        setStatus('⚠️ Sin conexión', '#fbbf24');
+        console.warn('Firebase init error:', e);
+      }
+    };
+    script2.onerror = function(){ setStatus('⚠️ Sin conexión', '#fbbf24'); };
+    document.head.appendChild(script2);
+  };
+  script1.onerror = function(){ setStatus('⚠️ Sin conexión', '#fbbf24'); };
+  document.head.appendChild(script1);
+}
+
+// ── SYNC FROM FIREBASE TO LOCALSTORAGE ───────────────────────────────
+function syncFromFirebase(){
+  if(!DB) return;
+  
+  SYNC_KEYS.forEach(function(key){
+    var col = COL_MAP[key];
+    DB.collection(col).orderBy('_idx').get().then(function(snap){
+      if(snap.empty) {
+        // First time: push localStorage data to Firebase
+        pushToFirebase(key);
+        return;
+      }
+      var data = snap.docs.map(function(d){ 
+        var obj = d.data();
+        delete obj._idx;
+        delete obj._id;
+        return obj;
+      });
+      // For nvp_cfg (single object)
+      if(key === 'nvp_cfg'){
+        var cfg = snap.docs[0]?snap.docs[0].data():{};
+        delete cfg._idx; delete cfg._id;
+        localStorage.setItem(key, JSON.stringify(cfg));
+      } else {
+        localStorage.setItem(key, JSON.stringify(data));
+      }
+    }).catch(function(e){
+      // Collection doesn't have _idx field yet - try without orderBy
+      DB.collection(col).get().then(function(snap){
+        if(snap.empty){ pushToFirebase(key); return; }
+        var data = snap.docs.map(function(d){
+          var obj = d.data();
+          delete obj._idx; delete obj._id;
+          return obj;
+        });
+        if(key==='nvp_cfg'){
+          var cfg = snap.docs[0]?snap.docs[0].data():{};
+          delete cfg._idx; delete cfg._id;
+          localStorage.setItem(key, JSON.stringify(cfg));
+        } else {
+          localStorage.setItem(key, JSON.stringify(data));
+        }
+      });
+    });
+  });
+}
+
+// ── PUSH LOCALSTORAGE TO FIREBASE ────────────────────────────────────
+function pushToFirebase(key){
+  if(!DB) return;
+  var col = COL_MAP[key];
+  try {
+    var raw = localStorage.getItem(key);
+    if(!raw) return;
+    var data = JSON.parse(raw);
+    var batch = DB.batch();
+    
+    if(key === 'nvp_cfg' || !Array.isArray(data)){
+      var ref = DB.collection(col).doc('config');
+      batch.set(ref, Object.assign({}, data||{}, {_idx:0}));
+    } else {
+      // Clear collection first
+      data.forEach(function(item, idx){
+        var docId = String(item.id || item.nro || ('doc'+idx));
+        var ref = DB.collection(col).doc(docId);
+        batch.set(ref, Object.assign({}, item, {_idx:idx}));
+      });
+    }
+    batch.commit().catch(function(e){ console.warn('Push error:', e); });
+  } catch(e){ console.warn('Push error:', e); }
+}
+
+// ── REALTIME LISTENERS ────────────────────────────────────────────────
+var _listeners = [];
+function startRealtimeListeners(){
+  if(!DB) return;
+  
+  // Listen for changes in key collections
+  ['nvp_c','nvp_pagos','nvp_gastos','nvp_vacantes'].forEach(function(key){
+    var col = COL_MAP[key];
+    var unsub = DB.collection(col).onSnapshot(function(snap){
+      if(snap.empty) return;
+      var data = snap.docs.map(function(d){
+        var obj = d.data();
+        delete obj._idx; delete obj._id;
+        return obj;
+      });
+      // Sort by _idx if available
+      data.sort(function(a,b){ return (a._idx||0)-(b._idx||0); });
+      var current = localStorage.getItem(key);
+      var newStr = JSON.stringify(data);
+      if(current !== newStr){
+        localStorage.setItem(key, newStr);
+        // Trigger React to re-read by dispatching storage event
+        window.dispatchEvent(new StorageEvent('storage', {key: key, newValue: newStr}));
+        setStatus('🔄 Sincronizado', '#6ee7b7');
+        setTimeout(function(){ setStatus('🔥 Conectado', '#6ee7b7'); }, 2000);
+      }
+    }, function(e){ console.warn('Listener error:', e); });
+    _listeners.push(unsub);
+  });
+}
+
+// ── INTERCEPT LOCALSTORAGE SETITEM ───────────────────────────────────
+// When app saves to localStorage, also save to Firebase
+var _origSetItem = localStorage.setItem.bind(localStorage);
+localStorage.setItem = function(key, value){
+  _origSetItem(key, value);
+  if(COL_MAP[key] && DB){
+    try {
+      var data = JSON.parse(value);
+      var col = COL_MAP[key];
+      var batch = DB.batch();
+      if(key === 'nvp_cfg' || !Array.isArray(data)){
+        var ref = DB.collection(col).doc('config');
+        batch.set(ref, Object.assign({}, data||{}, {_idx:0}));
+      } else {
+        // Delete old docs and write new ones
+        DB.collection(col).get().then(function(snap){
+          var delBatch = DB.batch();
+          snap.docs.forEach(function(d){ delBatch.delete(d.ref); });
+          delBatch.commit().then(function(){
+            var newBatch = DB.batch();
+            data.forEach(function(item, idx){
+              var docId = String(item.id||item.nroRecibo||item.nro||('doc'+idx));
+              var ref = DB.collection(col).doc(docId);
+              newBatch.set(ref, Object.assign({}, item, {_idx:idx}));
+            });
+            newBatch.commit().catch(function(e){ console.warn('Write error:',e); });
+          });
+        });
+        return; // async handled above
+      }
+      batch.commit().catch(function(e){ console.warn('Write error:',e); });
+    } catch(e){ console.warn('Firebase write error:',e); }
+  }
+};
+
+// ── STATUS BADGE IN SIDEBAR ───────────────────────────────────────────
+function addStatusBadge(){
+  var foot = document.querySelector('.sb-foot');
+  if(!foot || document.getElementById('fb-status-wrap')) return;
+  var wrap = document.createElement('div');
+  wrap.id = 'fb-status-wrap';
+  wrap.style.cssText = 'margin-top:8px;background:#1f2937;border-radius:6px;padding:6px 10px;display:flex;align-items:center;gap:6px;';
+  wrap.innerHTML = '<span style="font-size:10px;color:#6b7280;">Firebase</span>'
+    +'<span id="fb-status" style="font-size:10px;font-weight:600;color:#fbbf24;">Conectando...</span>';
+  foot.appendChild(wrap);
+}
+
+// ── START ─────────────────────────────────────────────────────────────
+// Wait for React to render sidebar, then add badge and init Firebase
+var _initDone = false;
+var _initInterval = setInterval(function(){
+  if(document.querySelector('.sb-foot') && !_initDone){
+    _initDone = true;
+    clearInterval(_initInterval);
+    addStatusBadge();
+    initFirebase();
+  }
+}, 500);
+
+})();
+</script>
 </body>
 </html>
